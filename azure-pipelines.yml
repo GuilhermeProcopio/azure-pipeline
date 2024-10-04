@@ -1,0 +1,126 @@
+# Maven package Java project Web App to Linux on Azure
+
+# Build your Java project and deploy it to Azure as a Linux web app
+# Add steps that analyze code, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/java
+
+
+trigger:
+- main
+
+variables:
+
+  # Azure Resource Manager connection created during pipeline creation
+  azureSubscription: ''
+
+  # Web app name
+  webAppName: 'webgoat-1521204'
+
+  # Environment name
+  environmentName: 'webgoat-1521204'
+
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+stages:
+- stage: Build
+  displayName: Build stage
+  jobs:
+  - job: MavenPackageAndPublishArtifacts
+    displayName: Maven Package and Publish Artifacts
+    pool:
+      vmImage: $(vmImageName)
+
+    steps:
+    - task: DockerInstaller@0
+      inputs:
+        dockerVersion: '17.09.0-ce'
+
+    - task: Bash@3
+      displayName: 'Checkout WebGoat code'
+      inputs:
+        targetType: 'inline'
+        script: |
+          git clone https://github.com/WebGoat/WebGoat.git
+          cd WebGoat
+          git checkout tags/v2023.5 -b webgoat_version
+    - task: Maven@4
+      displayName: 'Maven Package'
+      inputs:
+        mavenPomFile: 'WebGoat/pom.xml'
+        mavenOptions: '-Xmx3072m'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.17' 
+        jdkArchitectureOption: 'x64'
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        goals: 'clean package'
+    - task: Bash@3
+      displayName: 'Run Horusec Scan'
+      inputs:
+        targetType: 'inline'
+        script: |
+          curl -fsSL https://raw.githubusercontent.com/ZupIT/horusec/main/deployments/scripts/install.sh | bash -s latest
+          horusec start --disable-docker false -p ./ --log-level=info -o="sarif" -O="$(Build.ArtifactStagingDirectory)/horusec-report.sarif"
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Horusec SARIF Report'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/horusec-report.sarif'
+        ArtifactName: 'HorusecSASTReport'
+      
+    - task: CopyFiles@2
+      displayName: 'Copy Files to artifact staging directory'
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)'
+        Contents: '**/target/*.?(war|jar)'
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+
+    - upload: $(Build.ArtifactStagingDirectory)
+      artifact: drop
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeployLinuxWebApp
+    displayName: Deploy Linux Web App
+    environment: $(environmentName)
+    pool:
+      vmImage: $(vmImageName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureWebApp@1
+            displayName: 'Azure Web App Deploy: webgoat-1521204'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              appType: webAppLinux
+              appName: $(webAppName)
+              package: '$(Pipeline.Workspace)/drop/**/target/*.?(war|jar)'
+              startUpCommand: 'java -Dfile.encoding=UTF-8 -Dwebgoat.host=0.0.0.0 -Dwebgoat.port=80 -Dwebwolf.host=0.0.0.0 -Dwebwolf.port=9090 --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED -jar /home/site/wwwroot/webgoat.jar'
+
+- stage: DAST
+  displayName: 'DAST (Dynamic Application Security Testing)'
+  dependsOn: Deploy
+  jobs: 
+    - job: 'OWASPZAPScan'
+      displayName: 'OWASP ZAP DAST Scan'
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - bash: |
+            docker pull ghcr.io/zaproxy/zaproxy:weekly
+            docker pull zaproxy/zap-weekly
+        - bash: |
+            chmod -R 777  ./
+            docker run --rm -v $(pwd):/zap/wrk/:rw -t owasp/zap2docker-stable zap-full-scan.py -t http://$(ip -f inet -o addr show docker0 | awk '{print $4}' | cut -d '/' -f 1):80 -x xml_report.xml
+            true
+          displayName: 'Owasp Container Scan'
+        - task: PublishTestResults@2
+          displayName: 'Publish Test Results'
+          inputs:
+            testResultsFormat: 'NUnit'
+            testResultsFiles: 'converted_report.xml'
